@@ -38,8 +38,8 @@ if ([string]::IsNullOrWhiteSpace($libraryPathsString)) {
 	$vdfPath = "$defaultSteamPath\steamapps\libraryfolders.vdf"
 	if (Test-Path $vdfPath) {
 		$vdfContent = Get-Content $vdfPath -Raw
-		$matches = [regex]::Matches($vdfContent, '"path"\s+"([^"]+)"')
-		foreach ($match in $matches) {
+		$libMatches = [regex]::Matches($vdfContent, '"path"\s+"([^"]+)"')
+		foreach ($match in $libMatches) {
 			$p = $match.Groups[1].Value.Replace("\\", "\")
 			$fullPath = Join-Path $p "steamapps"
 			if (Test-Path $fullPath) { $libraryPaths += $fullPath }
@@ -49,6 +49,18 @@ if ([string]::IsNullOrWhiteSpace($libraryPathsString)) {
 	"LibraryPaths=$($libraryPaths -join ',')" | Out-File $configFile -Append
 } else {
 	$libraryPaths = $libraryPathsString -split ","
+}
+
+# 4. RESULTS LOG
+# Per-game steamcmd output goes to logs\<appid>.log, outcomes to logs\results.csv.
+# Games already recorded as OK are skipped, so an interrupted run can be resumed.
+$logDir = "$PSScriptRoot\logs"
+$resultsFile = "$logDir\results.csv"
+$steamCmdLog = Join-Path (Split-Path $steamCmd) "logs\console_log.txt"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$verified = @{}
+if (Test-Path $resultsFile) {
+	Import-Csv $resultsFile | Where-Object { $_.Result -eq "OK" } | ForEach-Object { $verified[$_.AppId] = $true }
 }
 
 # --- PROCESSING ---
@@ -64,12 +76,26 @@ Write-Host "Press Ctrl+C at any time to stop the script after the current game f
 
 foreach ($file in $allManifests) {
 	$current++
+	# Reset per game so an unreadable manifest can't reuse the previous game's values
+	$appid = $null; $name = $null; $installDirName = $null
 	$content = Get-Content $file.FullName -Raw
 	if ($content -match '"appid"\s+"(\d+)"') { $appid = $Matches[1] }
 	if ($content -match '"name"\s+"([^"]+)"') { $name = $Matches[1] }
 	if ($content -match '"installdir"\s+"([^"]+)"') { $installDirName = $Matches[1] }
-	$parentLib = Split-Path $file.FullName		
+	if (-not $appid -or -not $installDirName) {
+		Write-Host "`nSkipping unreadable manifest: $($file.FullName)" -ForegroundColor Red
+		continue
+	}
+	if ($verified[$appid]) {
+		Write-Host "`nAlready verified OK, skipping: $name (ID: $appid)" -ForegroundColor DarkGray
+		continue
+	}
+	$parentLib = Split-Path $file.FullName
 	$gamePath = Join-Path $parentLib "common\$installDirName"
+	# steamcmd creates a steamapps\ folder inside force_install_dir; remove it afterwards if we created it
+	$steamCmdDir = Join-Path $gamePath "steamapps"
+	$steamCmdDirExisted = Test-Path $steamCmdDir
+	$logStart = if (Test-Path $steamCmdLog) { (Get-Item $steamCmdLog).Length } else { 0 }
 
 	# Update Title
 	$percent = [math]::Round(($current / $total) * 100)
@@ -91,10 +117,43 @@ foreach ($file in $allManifests) {
             Write-Host "`nStopping SteamCMD..." -ForegroundColor Red
             $process | Stop-Process -Force
         }
+		if (-not $steamCmdDirExisted -and (Test-Path $steamCmdDir)) {
+			Remove-Item $steamCmdDir -Recurse -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	# Pull this game's portion of steamcmd's console log and record the outcome
+	$gameLog = ""
+	if (Test-Path $steamCmdLog) {
+		$stream = [System.IO.File]::Open($steamCmdLog, 'Open', 'Read', 'ReadWrite')
+		try {
+			$stream.Position = [math]::Min($logStart, $stream.Length)
+			$gameLog = (New-Object System.IO.StreamReader($stream)).ReadToEnd()
+		} finally { $stream.Close() }
+	}
+	$gameLog | Out-File "$logDir\$appid.log"
+	$detail = ([regex]::Matches($gameLog, "(Success! App '$appid'[^\r\n]*|Error! App '$appid'[^\r\n]*|FAILED[^\r\n]*)") | Select-Object -Last 1).Value
+	$result = if ($detail -like "Success!*") { "OK" } else { "FAILED" }
+	[pscustomobject]@{ AppId = $appid; Name = $name; Result = $result; Detail = $detail; Time = (Get-Date -Format s) } |
+		Export-Csv $resultsFile -Append -NoTypeInformation
+	$color = if ($result -eq "OK") { "Green" } else { "Red" }
+	Write-Host " Result: $result $detail" -ForegroundColor $color
+
+	# A failed login means every remaining game would fail too
+	if ($gameLog -match "FAILED \(|Login Failure|Invalid Password") {
+		Write-Host "`nSteam login failed - stopping. Run: steamcmd +login $username +quit" -ForegroundColor Red
+		break
 	}
 }
 
 $elapsed = (Get-Date) - $startTime
 $Host.UI.RawUI.WindowTitle = "Steam Verification Complete"
 Write-Host "`n[FINISHED] Total time: $($elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Green
+$failed = @(Import-Csv $resultsFile | Group-Object AppId | ForEach-Object { $_.Group[-1] } | Where-Object { $_.Result -ne "OK" })
+if ($failed.Count -gt 0) {
+	Write-Host "`n$($failed.Count) game(s) did not report success:" -ForegroundColor Red
+	$failed | ForEach-Object { Write-Host "  $($_.Name) (ID: $($_.AppId)) $($_.Detail)" -ForegroundColor Red }
+} else {
+	Write-Host "All games reported success. Results: $resultsFile" -ForegroundColor Green
+}
 pause
